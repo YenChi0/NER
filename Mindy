@@ -1,0 +1,311 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from collections import Counter
+
+##############################################################################
+# (A) 資料讀取：合併兩段程式的邏輯
+##############################################################################
+
+# 假設這幾個常量是我們會用到的特殊 token
+PAD_WORD = '<pad>'
+PAD_TAG = 'O'      # 或任何你想要的預設標籤
+UNK_WORD = 'UNK'
+PAD_LABEL = -1     # labels 裡面用 -1 表示 PAD
+
+class MyNERDataset(Dataset):
+    """
+    自訂的 Dataset，用來同時讀取「句子檔」和「標籤檔」，並產生 (sentence_tokens, label_tokens) pair。
+    """
+    def __init__(self, sentences_path, labels_path, vocab_dict, tag_dict, unk_ind, pad_ind):
+        # 讀檔
+        with open(sentences_path, encoding='utf-8') as f:
+            raw_sentences = f.read().splitlines()
+        with open(labels_path, encoding='utf-8') as f:
+            raw_labels = f.read().splitlines()
+
+        self.sentences = []
+        self.labels = []
+        for sent, label_line in zip(raw_sentences, raw_labels):
+            # 將一行 sentence 拆分
+            tokens = sent.split()
+            # 將一行 label 拆分
+            label_tokens = label_line.split()
+
+            # 轉成 index，如果找不到就在 vocab_dict 裡用 unk_ind
+            token_ids = [vocab_dict[token] if token in vocab_dict else unk_ind
+                         for token in tokens]
+            label_ids = [tag_dict[tag] for tag in label_tokens]
+
+            self.sentences.append(token_ids)
+            self.labels.append(label_ids)
+
+        self.pad_ind = pad_ind  # <pad> 在 vocab 的 index
+        # 這裡不直接對 data 做 padding，留給 collate_fn 動態處理
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, idx):
+        return self.sentences[idx], self.labels[idx]
+
+def ner_collate_fn(batch):
+    """
+    動態對一個 batch 裏多筆 (sentence_tokens, label_tokens) 做 padding。
+    同時將 PAD 的 label 設成 -1 (方便後面自定義 loss_fn 排除)。
+    """
+    # batch: List of (sent_ids, label_ids) with length = batch_size
+    sentences, labels = zip(*batch)  # 解壓成兩個 tuple
+
+    # 找到此 batch 內最長的句子長度
+    max_len = max(len(s) for s in sentences)
+
+    # 建立對應大小的 numpy array 來做 padding
+    batch_size = len(sentences)
+    batch_data = np.full((batch_size, max_len), fill_value=pad_ind, dtype=np.int64)
+    batch_label = np.full((batch_size, max_len), fill_value=PAD_LABEL, dtype=np.int64)
+
+    for i in range(batch_size):
+        seq_len = len(sentences[i])
+        batch_data[i, :seq_len] = sentences[i]
+        batch_label[i, :seq_len] = labels[i]
+
+    # 轉成 pytorch tensor
+    batch_data = torch.tensor(batch_data, dtype=torch.long)
+    batch_label = torch.tensor(batch_label, dtype=torch.long)
+
+    return batch_data, batch_label
+
+
+##############################################################################
+# (B) 自定義的 Loss 與 Accuracy：來自第二段程式
+##############################################################################
+def loss_fn(outputs, labels):
+    """
+    outputs: (batch*seq_len, num_tags) - 模型的 log_softmax 輸出
+    labels:  (batch, seq_len)          - 每個 token 的標籤 (若是PAD則為 -1)
+    """
+    # 攤平 labels => (batch * seq_len,)
+    labels = labels.view(-1)
+
+    # 建立 mask，用來忽略 labels < 0 (即 -1) 的位置
+    mask = (labels >= 0).float()
+
+    # 由於 -1 不能直接做 index，用 mod 或其他方法保留有效區間
+    # 不過如果我們確定 -1 只會在 PAD處，也可以先 clamp 到 0
+    labels = labels % outputs.shape[1]  # 保證落在 valid range
+
+    num_tokens = int(torch.sum(mask))   # 有效 token 數量
+
+    # 注意 outputs 已是 log_softmax 結果 => log(P) => 取特定 label 的 log(P)
+    # 利用 mask 忽略 padded token 的 loss
+    # outputs[range(outputs.shape[0]), labels] shape => (batch*seq_len,)
+    # 只 sum 有效部分，再除以有效 token 數
+    return -torch.sum(outputs[range(outputs.shape[0]), labels] * mask) / num_tokens
+
+
+def accuracy(outputs, labels):
+    """
+    outputs: (batch*seq_len, num_tags) - numpy array
+    labels:  (batch, seq_len)          - numpy array (PAD=-1)
+    回傳整體的 (float) accuracy
+    """
+    # 攤平成 (batch*seq_len,)
+    labels = labels.ravel()
+
+    # 建立 mask
+    mask = (labels >= 0)
+
+    # outputs 是 log_softmax => argmax 得到最可能的 tag
+    pred = np.argmax(outputs, axis=1)
+
+    return np.sum(pred[mask] == labels[mask]) / float(np.sum(mask))
+
+
+##############################################################################
+# (C) BiLSTM + Additive Attention 模型 (改寫第一段程式)
+##############################################################################
+
+class BiLSTMAttentionNER(nn.Module):
+    def __init__(self, vocab_size, tagset_size, embedding_dim=50, hidden_dim=50, attn_dim=32, pad_idx=0):
+        super(BiLSTMAttentionNER, self).__init__()
+        # Embedding
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
+        # BiLSTM
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, bidirectional=True, batch_first=True)
+
+        # Additive Attention 相關參數
+        self.attn_W = nn.Linear(hidden_dim * 2, attn_dim)
+        self.attn_v = nn.Linear(attn_dim, 1, bias=False)
+
+        # 最終分類器: 對每個 time step 預測
+        self.fc = nn.Linear(hidden_dim * 2, tagset_size)
+
+    def attention(self, lstm_output):
+        """
+        lstm_output: (batch_size, seq_len, hidden_dim*2)
+        return context向量 (batch_size, hidden_dim*2)
+        """
+        # additive attention
+        attn_weights = torch.tanh(self.attn_W(lstm_output))  # -> (batch, seq_len, attn_dim)
+        attn_weights = self.attn_v(attn_weights)             # -> (batch, seq_len, 1)
+        attn_weights = torch.softmax(attn_weights, dim=1)    # -> (batch, seq_len, 1)
+
+        # 加權求和
+        context = attn_weights * lstm_output
+        context = context.sum(dim=1)  # (batch, hidden_dim*2)
+        return context
+
+    def forward(self, x):
+        """
+        x: (batch_size, seq_len)
+        回傳: (batch_size*seq_len, tagset_size)，並且是 log_softmax
+        """
+        # 1) embedding
+        embeds = self.embedding(x)  # (batch, seq_len, embedding_dim)
+
+        # 2) BiLSTM
+        lstm_out, _ = self.lstm(embeds)  # (batch, seq_len, hidden_dim*2)
+
+        # 3) 每個 time-step 的 logits
+        logits = self.fc(lstm_out)       # (batch, seq_len, tagset_size)
+
+        # 4) reshape => (batch*seq_len, tagset_size)
+        logits = logits.view(-1, logits.shape[2])
+
+        # 5) 回傳 log_softmax (第二段程式建議使用 log_softmax)
+        return F.log_softmax(logits, dim=1)
+
+
+##############################################################################
+# (D) 主程式 (讀取詞典 + 建立Dataset/DataLoader + 訓練 + 評估)
+##############################################################################
+if __name__ == "__main__":
+
+    torch.manual_seed(42)
+
+    # 假設以下兩篇是我們的 train (第一篇) 與 test (第二篇)
+    train_sent_path = "C:/Users/user/Downloads/sentences(一句一行版).txt"
+    train_label_path = "C:/Users/user/Downloads/labels(一句一行版).txt"
+    test_sent_path  = "C:/Users/user/Downloads/sentences(一句一行版).txt"
+    test_label_path = "C:/Users/user/Downloads/labels(一句一行版).txt"
+
+    # 先掃描整份資料庫(兩篇) 以統計詞頻
+    words_counter = Counter(
+        open(train_sent_path, encoding='utf-8').read().split() +
+        open(test_sent_path,  encoding='utf-8').read().split()
+    )
+    tags_counter = Counter(
+        open(train_label_path, encoding='utf-8').read().split() +
+        open(test_label_path,  encoding='utf-8').read().split()
+    )
+
+    # 如果想要過濾低頻詞，可以設 MIN_COUNT > 1
+    MIN_COUNT = 1
+    words = [w for w, c in words_counter.items() if c >= MIN_COUNT]
+    tags  = [t for t, c in tags_counter.items() if c >= MIN_COUNT]
+
+    # 確保 PAD_WORD, PAD_TAG, UNK_WORD 都在列表裡
+    if PAD_WORD not in words:
+        words.append(PAD_WORD)
+    if PAD_TAG not in tags:
+        tags.append(PAD_TAG)
+    # UNK_WORD 加到 vocab 中
+    if UNK_WORD not in words:
+        words.append(UNK_WORD)
+
+    # 建立 vocab dict
+    vocab_dict = {w: i for i, w in enumerate(words)}
+    tag_dict   = {t: i for i, t in enumerate(tags)}
+
+    # 找到特定 token 的 index
+    unk_ind = vocab_dict[UNK_WORD]
+    pad_ind = vocab_dict[PAD_WORD]
+
+    # Debug: 看一下大小
+    print(f"Vocab size = {len(vocab_dict)}; Tag size = {len(tag_dict)}")
+
+    # 分別建立 train/test dataset
+    train_dataset = MyNERDataset(train_sent_path, train_label_path, vocab_dict, tag_dict, unk_ind, pad_ind)
+    test_dataset  = MyNERDataset(test_sent_path,  test_label_path,  vocab_dict, tag_dict, unk_ind, pad_ind)
+
+    # 建立 DataLoader (batch_size 視需求調整)
+    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=ner_collate_fn)
+    test_loader  = DataLoader(test_dataset,  batch_size=2, shuffle=False, collate_fn=ner_collate_fn)
+
+    # 建立模型 (使用我們的 BiLSTMAttentionNER)
+    model = BiLSTMAttentionNER(
+        vocab_size=len(vocab_dict),
+        tagset_size=len(tag_dict),
+        embedding_dim=50,
+        hidden_dim=50,
+        attn_dim=32,
+        pad_idx=pad_ind
+    )
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # 開始訓練
+    EPOCHS = 5
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss, total_acc, total_count = 0.0, 0.0, 0
+
+        for batch_idx, (batch_data, batch_label) in enumerate(train_loader):
+            # forward
+            outputs = model(batch_data)
+            # outputs.shape => (batch_size*seq_len, tagset_size)
+
+            # 計算 loss
+            loss = loss_fn(outputs, batch_label)
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # 計算 accuracy
+            acc_val = accuracy(outputs.detach().cpu().numpy(), batch_label.detach().cpu().numpy())
+
+            batch_size = batch_data.size(0)
+            total_loss += loss.item() * batch_size
+            total_acc  += acc_val      * batch_size
+            total_count += batch_size
+
+            # 每个batch打印一次损失和准确率
+            print(f"[Epoch {epoch+1}/{EPOCHS}], Batch {batch_idx+1}/{len(train_loader)}: loss={loss.item():.4f}, acc={acc_val:.4f}")
+
+            # 获取每个 batch 的预测结果（guess）与实际标签（correct）
+            guess = np.argmax(outputs.detach().cpu().numpy(), axis=1)
+            correct = batch_label.detach().cpu().numpy().ravel()
+
+            # 只打印出非 PAD 的 token
+            mask = correct >= 0
+            guess = guess[mask]
+            correct = correct[mask]
+
+            # 打印出每个预测的 guess 和对应的 correct
+            print(f"Guess: {guess.tolist()}")
+            print(f"Correct: {correct.tolist()}")
+
+        print(f"[Epoch {epoch+1}/{EPOCHS}] train_loss={total_loss/total_count:.4f}, train_acc={total_acc/total_count:.4f}")
+
+    # 測試/評估
+    model.eval()
+    total_loss, total_acc, total_count = 0.0, 0.0, 0
+    with torch.no_grad():
+        for batch_data, batch_label in test_loader:
+            outputs = model(batch_data)
+            loss = loss_fn(outputs, batch_label)
+            acc_val = accuracy(outputs.cpu().numpy(), batch_label.cpu().numpy())
+
+            batch_size = batch_data.size(0)
+            total_loss += loss.item() * batch_size
+            total_acc  += acc_val      * batch_size
+            total_count += batch_size
+
+    print(f"Test Loss = {total_loss/total_count:.4f}, Test Acc = {total_acc/total_count:.4f}")
+
+    print("Finished!")
