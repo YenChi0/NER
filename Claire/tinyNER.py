@@ -74,6 +74,10 @@ if __name__ == "__main__":
 
     sentences = [[vocab.get(token, unk_ind) for token in sentence] for sentence in sentences]
     labels = [[tag_map[label] for label in label_seq] for label_seq in labels]
+    # 印出標籤對應索引
+    print("Tag to Index Mapping:")
+    for tag, index in tag_map.items():
+        print(f"{tag}: {index}")
 
     batch_max_len = max(len(s) for s in sentences)
 
@@ -107,10 +111,22 @@ if __name__ == "__main__":
         train_batch, labels_batch = get_batch(sentences[s_index], labels[s_index])
         output_batch = model(train_batch)
         predict = [torch.argmax(each_ner).item() for each_ner in output_batch]
-        loss = loss_fn(output_batch, labels_batch)
-        acc_rate = accuracy(output_batch.data.cpu().numpy(), labels_batch.data.cpu().numpy())
+        # loss = loss_fn(output_batch, labels_batch)
+        # acc_rate = accuracy(output_batch.data.cpu().numpy(), labels_batch.data.cpu().numpy())
         print(f"guess count = {len(predict)}, ans count= {labels_batch.size(1)}")
         print(f"guess  = {predict}\nanslst = {labels_batch.tolist()[0]}")
-        total_loss += loss.item()
+    #     total_loss += loss.item()
+    #     total_acc += acc_rate
+    # print(f"loss = {total_loss / len(sentences):.2f} ... acc_rate = {total_acc / 10:.2f}")
+
+    for i in range(len(sentences)):
+        train_batch, labels_batch = get_batch(sentences[i], labels[i])
+        output_batch = model(train_batch)
+        loss = loss_fn(output_batch, labels_batch)
+        acc_rate = accuracy(output_batch.data.cpu().numpy(), labels_batch.data.cpu().numpy())
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         total_acc += acc_rate
-    print(f"loss = {total_loss / len(sentences):.2f} ... acc_rate = {total_acc / 10:.2f}")
+        total_loss += loss.item()
+    print(f"loss: {total_loss / len(sentences):.2f}... acc_rate = {total_acc / len(sentences):.2f}")
